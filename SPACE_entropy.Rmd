@@ -1,0 +1,889 @@
+---
+title: "Spatial Entropy"
+#date: '`r format(Sys.time(), "%Y-%m-%d")`'
+output:
+  html_document: 
+    code_folding: hide
+    toc: true
+    toc_float: true
+hitheme: tomorrow
+highlighter: highlight.js
+---
+
+
+```{r setup , include=FALSE}
+library(survival)
+library(survminer)
+library(dplyr)
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(skimr)
+library(phenoptr)
+library(phenoptrReports)
+library(rtree)
+library(data.table)
+library(pivottabler)
+library(ggpubr)
+library(zoo)
+library(lubridate)
+library(reReg)
+library(spatstat)
+library(refund)
+library(mgcv)
+library(scam)
+library(SpatEntropy)
+library(fdapace)
+library(plot3D)
+library(refund)
+library(refund.shiny)
+
+knitr::opts_chunk$set(echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 6
+)
+
+theme_set(theme_bw() + theme(legend.position = "bottom"))
+```
+
+
+# Input data
+## Load source functions
+```{r}
+source_dir = "~/Documents/Imaging project/Vectra /" # keep the space after Vectra
+source(paste0(source_dir, "ref_functions.R"))
+```
+
+## Read in lung cancer data
+```{r, echo=FALSE, warning=FALSE}
+setwd("~/Documents/Imaging project/Vectra /Lung_survival_ouput")
+#load("Lung_workspace.RData")
+load("lung_slide_analysis.RData")
+```
+
+```{r, warning=FALSE, echo = FALSE}
+mhcii <- read_csv(paste0(CDir, "HLADR_status.csv"))[,-1]
+colnames(mhcii)[1] = "Sample Name"
+lung_clinical_data = left_join(lung_clinical_data, mhcii, by = "Sample Name")
+```
+
+# visualize images based on survival
+ 
+```{r, warning=FALSE, echo = FALSE, message=FALSE}
+n_surv = 15
+event_id = which(lung_clinical_data$`Censor (0=Alive, 1=Dead)` == 1)
+censor_id = which(lung_clinical_data$`Censor (0=Alive, 1=Dead)` == 0)
+#best_surv = event_id[order(lung_clinical_data$`Survival (days)`[event_id], decreasing = T)[1:n_surv]]
+best_surv = censor_id[order(lung_clinical_data$`Survival (days)`[censor_id], decreasing = T)[1:n_surv]]
+worst_surv = event_id[order(lung_clinical_data$`Survival (days)`[event_id])[1:n_surv]]
+
+plt_group = head(best_surv, 12)
+df <- NULL
+for(i in plt_group){
+   
+temp = slide_idx[[i]] 
+cell_rm = c(which(lung_data$Phenotype[temp] == "Other+"), which(is.na(lung_data$Phenotype[temp])))#, which(lung_data$Phenotype[temp] == "CK+"))
+
+if (length(cell_rm) > 0){temp = temp[-cell_rm]
+}else {temp = temp}
+
+temp_df = data.frame(x = lung_data$`Cell X Position`[temp], y =  lung_data$`Cell Y Position`[temp], cell_type = as.factor(lung_data$Phenotype[temp]), patient = paste0("Patient ", i))
+df <- rbind(df,temp_df)
+}
+
+ggplot(df, aes(x = x, y = y, col = cell_type)) + geom_point(size = 0.25) + xlab("X position") + ylab("Y position")   + theme(plot.title = element_text(hjust = 0.5))+ theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + facet_wrap(~ patient)
+
+
+plt_group = head(worst_surv, 12)
+df <- NULL
+for(i in plt_group){
+   
+temp = slide_idx[[i]] 
+cell_rm = c(which(lung_data$Phenotype[temp] == "Other+"), which(is.na(lung_data$Phenotype[temp])))#, which(lung_data$Phenotype[temp] == "CK+"))
+if (length(cell_rm) > 0){temp = temp[-cell_rm]
+}else {temp = temp}
+
+temp_df = data.frame(x = lung_data$`Cell X Position`[temp], y =  lung_data$`Cell Y Position`[temp], cell_type = as.factor(lung_data$Phenotype[temp]), patient = paste0("Patient ", i))
+df <- rbind(df,temp_df)
+}
+
+ggplot(df, aes(x = x, y = y, col = cell_type)) + geom_point(size = 0.25) + xlab("X position") + ylab("Y position")   + theme(plot.title = element_text(hjust = 0.5))+ theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + facet_wrap(~ patient)
+```
+
+```{r, warning=FALSE, echo = FALSE, message=FALSE}
+n_break = 20
+entropy_all = list()  
+for (i in 1:n_patient){
+  if(i %% 20 == 0){
+    cat(paste0("iteration: ", i, "\n"))
+  }
+  
+  
+temp = slide_idx[[i]]
+
+cell_rm = c(which(lung_data$Phenotype[temp] == "Other+"), which(is.na(lung_data$Phenotype[temp])))
+#cell_rm = c(which(lung_data$Phenotype[temp] == "Other+"), which(is.na(lung_data$Phenotype[temp])), which(lung_data$Phenotype[temp] == "CK+"))
+
+if (length(cell_rm) > 0){temp = temp[-cell_rm]
+}else {temp = temp}
+
+
+x_pos = lung_data$`Cell X Position`[temp]
+y_pos = lung_data$`Cell Y Position`[temp]
+patient_i = ppp(x_pos, y_pos, c(min(x_pos), max(x_pos)), c(min(y_pos), max(y_pos)))
+patient_i = patient_i %mark% as.factor(lung_data$Phenotype[temp])
+
+# QUANTILES
+#dist_i = pairdist(patient_i)
+#dist_i = dist_i[lower.tri(dist_i, diag = FALSE)]
+#dist_i = quantile(dist_i, probs = prob_seq)
+
+# ADAPTIVE DISTANCE BREAKS
+#rmax_i = diameter(as.rectangle(patient_i)) 
+
+dist_i = pairdist(patient_i)
+rmax_i= max(dist_i[lower.tri(dist_i, diag = FALSE)])
+dist_i = exp(seq(log(0.05*rmax_i), log(rmax_i), length.out = n_break))  #make.even.breaks(rmax_i, bstep = rmax_i/20)$r
+dist_i = dist_i[-length(dist_i)]
+
+entropy_all[[i]] = altieri(patient_i, distbreak = dist_i) #dist_range
+}
+
+#ttt = pairdist(patient_i)
+#min(ttt[lower.tri(ttt, diag = FALSE)])
+#max(ttt[lower.tri(ttt, diag = FALSE)])
+```
+#setwd("~/Documents/Imaging project/Vectra /Spatial entropy output")
+#save(entropy_all, file = "lung_maxdist.RData) #based on max pairdist to create sequence
+#load("lung_maxdist.RData")
+#load("lung_immune_maxdist.RData") # without CK+
+
+```{r, warning=FALSE, echo = FALSE, message=FALSE}
+n_patient = length(entropy_all)
+dist_all = spi_all = res_all = list()
+df_all <- NULL
+for(i in 1:n_patient){
+   
+temp = entropy_all[[i]]
+dist_i = unique(c(temp$distance.breaks[,1],temp$distance.breaks[,2]))[-1]
+spi_i = temp$SPI.terms
+res_i = temp$RES.terms
+dist_all[[i]] = dist_i
+spi_all[[i]] = spi_i
+res_all[[i]] = res_i
+temp_df = data.frame(dist_break = dist_i, spi_i = spi_i, res_i  =  res_i, patient = paste0("Patient ", i))
+df_all = rbind(df_all, temp_df)
+}
+```
+
+### figures for manuscript
+
+```{r, warning=FALSE, echo = FALSE, message=FALSE}
+
+# for images 28 vs 137
+i = 137 #137
+df <- NULL
+
+temp = slide_idx[[i]] 
+cell_rm = c(which(lung_data$Phenotype[temp] == "Other+"), which(is.na(lung_data$Phenotype[temp])))#, which(lung_data$Phenotype[temp] == "CK+"))
+
+if (length(cell_rm) > 0){temp = temp[-cell_rm]
+}else {temp = temp}
+
+temp_df = data.frame(x = lung_data$`Cell X Position`[temp], y =  lung_data$`Cell Y Position`[temp], cell_type = as.factor(lung_data$Phenotype[temp]))
+df <- rbind(df,temp_df)
+
+
+ggplot(df, aes(x = x, y = y, col = cell_type)) + geom_point(size = 0.6) + xlab("X position") + ylab("Y position")   + theme(plot.title = element_text(hjust = 0.5))+ theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "bottom")
+# corresponding spi
+
+temp <- NULL
+temp_df <- data.frame(x = dist_all[[i]], y= spi_all[[i]], col=i)
+temp <- rbind(temp,temp_df)
+
+ggplot(temp,aes(x = x, y = y, group=col)) + geom_line() +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") + ylim(0,1)
+
+# all spi curves
+
+temp <- NULL
+for(i in 1:n_patient){ 
+  temp_df <- data.frame(x = dist_all[[i]], y= res_all[[i]], col=i)
+  temp <- rbind(temp,temp_df)} 
+
+ggplot(temp,aes(x = x, y = y, group=col)) + geom_line(stat = "identity", alpha = 0.4) +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") #+ ylim(0,2.2)
+
+```
+
+
+```{r, warning=FALSE, echo = FALSE, message=FALSE}
+#plt_group = c(125, 91, 47, 112, 139,99)
+plt_group = c(73, 88, 100, 96, 103)
+df <- NULL
+for(i in plt_group){
+   
+temp = slide_idx[[i]] 
+cell_rm = c(which(lung_data$Phenotype[temp] == "Other+"))#, which(is.na(lung_data$Phenotype[temp])), which(lung_data$Phenotype[temp] == "CK+"))
+
+if (length(cell_rm) > 0){temp = temp[-cell_rm]
+}else {temp = temp}
+
+temp_df = data.frame(x = lung_data$`Cell X Position`[temp], y =  lung_data$`Cell Y Position`[temp], cell_type = as.factor(lung_data$Phenotype[temp]), patient = paste0("Patient ", i))
+df <- rbind(df,temp_df)
+}
+
+ggplot(df, aes(x = x, y = y, col = cell_type)) + geom_point(size = 0.25) + xlab("X position") + ylab("Y position")   + theme(plot.title = element_text(hjust = 0.5))+ theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + facet_wrap(~ patient)
+
+temp <- NULL
+for(i in plt_group){ 
+  temp_df <- data.frame(x = dist_all[[i]], y= res_all[[i]], col=i)
+  temp <- rbind(temp,temp_df)} 
+
+ggplot(temp,aes(x = x, y = y, group=col)) + geom_line(stat = "identity", alpha = 0.4) +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") + ylim(0,2.5)
+
+
+```
+
+
+
+
+
+```{r}
+df_all$spi_i[is.infinite(df_all$spi_i)] = 0
+df1 = df_all[,-3]
+colnames(df1) = c(".index", ".value", ".id")
+df1 = df1[,c(".id", ".index", ".value")]
+
+test_mdl = fpca.sc(ydata =df1)
+plot_shiny(obj = test_mdl)
+```
+
+
+
+
+
+```{r, warning=FALSE, echo = FALSE, message=FALSE}
+#best vs worst survival
+
+temp <- NULL
+for(i in best_surv){ 
+  temp_df <- data.frame(x = dist_all[[i]], y= spi_all[[i]], col=i)
+  temp <- rbind(temp,temp_df)} 
+
+ggplot(temp,aes(x = x, y = y, group=col)) + geom_line(stat = "identity", alpha = 0.4) +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") + ylim(0,2.5)
+
+temp <- NULL
+for(i in worst_surv){ 
+  temp_df <- data.frame(x = dist_all[[i]], y= spi_all[[i]], col=i)
+  temp <- rbind(temp,temp_df)} 
+
+ggplot(temp,aes(x = x, y = y, group=col)) + geom_line(stat = "identity", alpha = 0.4) +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") + ylim(0,2.5)
+
+
+temp <- NULL
+for(i in best_surv){ 
+  temp_df <- data.frame(x = dist_all[[i]], y= res_all[[i]], col=i)
+  temp <- rbind(temp,temp_df)} 
+
+ggplot(temp,aes(x = x, y = y, group=col)) + geom_line(stat = "identity", alpha = 0.4) +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") + ylim(0,3)
+
+temp <- NULL
+for(i in worst_surv){ 
+  temp_df <- data.frame(x = dist_all[[i]], y= res_all[[i]], col=i)
+  temp <- rbind(temp,temp_df)} 
+
+ggplot(temp,aes(x = x, y = y, group=col)) + geom_line(stat = "identity", alpha = 0.4) +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") + ylim(0,3)
+
+```
+
+### FPCA with PACE 
+```{r, warning=FALSE, echo = FALSE, message=FALSE}
+test_res1 <- FPCA(spi_all, dist_all)#, list(userBwMu = 10, dataType='Sparse', error=FALSE, kernel='epan', verbose=TRUE))
+plot(test_res1) 
+#test_res2 <- FPCA(res_all, dist_all)#, list(userBwMu = 10, dataType='Sparse', error=FALSE, kernel='epan', verbose=TRUE))
+#plot(test_res2) 
+# predicted trajectories?
+#CreatePathPlot(test_res, subset = c(head(best_surv, 3)), showMean = T, ylim = c(0,2.5))
+#CreatePathPlot(test_res, subset = c(head(worst_surv, 3)), showMean = T, ylim = c(0,2.5))
+
+```
+
+```{r}
+plot(test_res1$xiEst[,1], test_res1$xiEst[,2])
+
+```
+
+
+```{r}
+CreateCovPlot(test_res1, corr = TRUE)
+#CreateCovPlot(test_res2, corr = TRUE)
+```
+
+```{r}
+# PC score functions
+Xi_hat1 = test_res1$xiEst
+#Xi_hat2 = test_res2$xiEst
+
+data_combine = data.frame(event = lung_clinical_data$`Censor (0=Alive, 1=Dead)`, stime = lung_clinical_data$`Survival (days)`/365,
+                          stage_group = as.factor(lung_clinical_data$`Stage (numeric)`), Age = lung_clinical_data$`Age at Diagnosis`, 
+                          spa_e = Xi_hat1)#, res_e = Xi_hat2)  #spa_e: spatial entropy, res_e: residual entropy
+
+# 5 year survival
+#event_id = which(data_combine$event == 1)
+#data_combine$event[event_id] = ifelse(data_combine$stime[event_id] > 10, 0, 1)
+
+test_fit <- gam(stime ~ Age + stage_group + spa_e.1 + spa_e.2 , weights=event, data = data_combine, family=cox.ph()) #+ PC1.1 + PC1.2
+
+summary(test_fit)
+# alternatively
+#fullcoxresult<-coxph(formula=Surv(stime,event)~ ., data = data_combine)
+fullcox<-coxph(formula=Surv(stime,event)~ Age + stage_group + spa_e.1 + spa_e.2, data = data_combine)
+nestcox<-coxph(formula=Surv(stime,event)~ Age + stage_group, data = data_combine)
+anova(fullcox, nestcox)
+```
+
+
+
+```{r}
+plot(test_mdl$scores[,1], test_mdl$scores[,2])
+```
+
+```{r}
+# PC score functions
+Xi_hat1 = test_mdl$scores
+
+
+data_combine = data.frame(event = lung_clinical_data$`Censor (0=Alive, 1=Dead)`, stime = lung_clinical_data$`Survival (days)`/365,
+                          stage_group = as.factor(lung_clinical_data$`Stage (numeric)`), Age = lung_clinical_data$`Age at Diagnosis`, 
+                          spa_e = Xi_hat1)
+# 5 year survival
+#event_id = which(data_combine$event == 1)
+#data_combine$event[event_id] = ifelse(data_combine$stime[event_id] > 10, 0, 1)
+
+test_fit <- gam(stime ~ Age + stage_group + spa_e.1 + spa_e.2 + spa_e.3 , weights=event, data = data_combine, family=cox.ph()) 
+
+summary(test_fit)
+# alternatively
+#fullcoxresult<-coxph(formula=Surv(stime,event)~ ., data = data_combine)
+# alternatively
+fullcox<-coxph(formula=Surv(stime,event)~ Age + stage_group + spa_e.1 + spa_e.2 + spa_e.3, data = data_combine)
+nestcox<-coxph(formula=Surv(stime,event)~ Age + stage_group, data = data_combine)
+anova(fullcox, nestcox)
+```
+
+###################################
+##TNBC
+##################################
+
+```{r, warning=FALSE}
+# TNBC data
+setwd("/Users/vut3/Documents/Imaging project/Vectra /TNBC_shareCellData")
+#save.image(file = "tnbc_workspace.RData")
+load("tnbc_workspace.RData")
+```
+
+
+```{r}
+tnbc = tnbc %>% mutate("Phenotype" = case_when(`Group` == 6 | `Group` == 5 ~ "Tumor", `Group` == 1  ~ "Unidentified", `Group` == 2  ~ "Immune", `Group` == 3  ~ "Endothelial", `Group` == 4  ~ "Mesenchymal-like"))
+
+```
+
+```{r}
+samp_rm = unique(c(which(tnbc_class$patient_class == 2), 22, 30, 38))
+n_surv = 15
+event_id = which(tnbc_clinical$Censored == 0)
+censor_id = which(tnbc_clinical$Censored == 1)
+#best_surv = event_id[order(lung_clinical_data$`Survival (days)`[event_id], decreasing = T)[1:n_surv]]
+best_surv = censor_id[order(tnbc_clinical$`Survival_days_capped*`[censor_id], decreasing = T)[1:n_surv]]
+worst_surv = event_id[order(tnbc_clinical$`Survival_days_capped*`[event_id])[1:n_surv]]
+```
+
+
+```{r}
+entropy_tnbc = list()
+for (i in 1:N){
+  if(i %% 20 == 0){
+    cat(paste0("iteration: ", i, "\n"))
+  }
+  
+  if(i == 30){next}
+  else{
+  
+    
+  temp = all_idx[[i]]
+  
+  #remove unidentified cells
+  #cell_rm = which(tnbc$Group[temp] == 1)
+   cell_rm = which(tnbc$Phenotype[temp] == "Unidentified")
+  if (length(cell_rm) > 0){
+    temp = temp[-cell_rm]
+    x_pos = center_x[[i]][-cell_rm]
+    y_pos = center_y[[i]][-cell_rm]
+  }else {temp = temp
+  x_pos = center_x[[i]]
+  y_pos = center_y[[i]]
+  }
+  patient_i = ppp(x_pos, y_pos, c(min(x_pos), max(x_pos)), c(min(y_pos), max(y_pos))) 
+  patient_i = patient_i %mark% as.factor(tnbc$Phenotype[temp]) #as.factor(tnbc$Group[temp])
+  
+  dist_i = pairdist(patient_i)
+  rmax_i= max(dist_i[lower.tri(dist_i, diag = FALSE)])
+  dist_i = exp(seq(log(0.05*rmax_i), log(rmax_i), length.out = 20))  #make.even.breaks(rmax_i, bstep = rmax_i/20)$r
+  dist_i = dist_i[-length(dist_i)]
+ 
+   entropy_tnbc[[i]] = altieri(patient_i, distbreak = dist_i) 
+  }
+}
+#ttt = pairdist(patient_i)
+#min(ttt[lower.tri(ttt, diag = FALSE)])
+#max(ttt[lower.tri(ttt, diag = FALSE)])
+```
+#setwd("~/Documents/Imaging project/Vectra /Spatial entropy output")
+#load("tnbc_maxdist.RData")
+```{r}
+dist_all = spi_all = res_all = list()
+df <- NULL
+for(i in 1:n_patient){
+   
+  
+if(i == 30){next}
+  else{  
+temp = entropy_tnbc[[i]]
+dist_i = unique(c(temp$distance.breaks[,1],temp$distance.breaks[,2]))[-1]
+spi_i = temp$SPI.terms
+res_i = temp$RES.terms
+dist_all[[i]] = dist_i * 0.39
+spi_all[[i]] = spi_i
+res_all[[i]] = res_i
+temp_df = data.frame(dist_break = dist_i * 0.39, spi_i = spi_i, res_i  =  res_i, patient = paste0("Patient ", i))
+df = rbind(df, temp_df)
+  }
+}
+```
+
+```{r}
+# figs for manuscript
+plt_group = c(1:4)
+df1 <- NULL
+for(i in plt_group){
+  temp = all_idx[[i]]
+#id = which(new_df$SampleID == i)
+
+ cell_rm = which(tnbc$Phenotype[temp] == "Unidentified")
+  if (length(cell_rm) > 0){
+    temp = temp[-cell_rm]
+    x_pos = center_x[[i]][-cell_rm]
+    y_pos = center_y[[i]][-cell_rm]
+  }else {temp = temp
+  x_pos = center_x[[i]]
+  y_pos = center_y[[i]]
+  }
+ 
+ 
+temp = data.frame(x = x_pos, y =  y_pos, cell_type = as.factor(tnbc$Phenotype[temp]), patient = i)
+df1 = rbind(df1, temp)
+}
+
+
+ggplot(df1, aes(x = x, y = y, col = cell_type)) + geom_point(size = 0.1) + theme(plot.title = element_text(hjust = 0.5))+ theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + facet_wrap(~ patient, scales = "free") + guides(x = "none", y = "none") #xlab("X position") + ylab("Y position") 
+
+
+ggplot(df, aes(x = dist_break, y = spi_i, group = patient)) + geom_line(alpha = 0.4) + xlab("r (microns)") + ylab("SPI")   + theme(plot.title = element_text(hjust = 0.5))+ theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none")
+
+
+```
+
+
+```{r, warning=FALSE, echo = FALSE, message=FALSE}
+
+ggplot(df, aes(x = dist_break, y = spi_i, col = patient)) + geom_line() + xlab("r (microns)") + ylab("Spatial Entropy")   + theme(plot.title = element_text(hjust = 0.5))+ theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none")
+
+ggplot(df, aes(x = dist_break, y = res_i, col = patient)) + geom_line() + xlab("r (microns)") + ylab("Residual Entropy")   + theme(plot.title = element_text(hjust = 0.5))+ theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none")
+
+```
+
+#best_surv vs worst_surv
+```{r}
+temp <- NULL
+for(i in best_surv){ 
+  temp_df <- data.frame(x = dist_all[[i]], y= spi_all[[i]], col=i)
+  temp <- rbind(temp,temp_df)} 
+
+ggplot(temp,aes(x = x, y = y, group=col)) + geom_line(stat = "identity", alpha = 0.4) +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") + ylim(0,1)
+
+
+temp <- NULL
+for(i in c(23,16,7,21,2,8,13)){ 
+  temp_df <- data.frame(x = dist_all[[i]], y= spi_all[[i]], col=i)
+  temp <- rbind(temp,temp_df)} 
+
+ggplot(temp,aes(x = x, y = y, group=col)) + geom_line(stat = "identity", alpha = 0.4) +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") + ylim(0,1)
+```
+
+
+
+### FPCA with PACE 
+```{r, warning=FALSE, echo = FALSE, message=FALSE}
+test_res1 <- FPCA(spi_all[-samp_rm], dist_all[-samp_rm])#, list(userBwMu = 10, dataType='Sparse', error=FALSE, kernel='epan', verbose=TRUE))
+plot(test_res1) 
+#test_res2 <- FPCA(res_all[-samp_rm], dist_all[-samp_rm])#, list(userBwMu = 10, dataType='Sparse', error=FALSE, kernel='epan', verbose=TRUE))
+#plot(test_res2) 
+# predicted trajectories?
+#CreatePathPlot(test_res1, subset = c(head(best_surv, 3)), showMean = T, ylim = c(0,2.5))
+#CreatePathPlot(test_res1, subset = c(head(worst_surv, 3)), showMean = T, ylim = c(0,2.5))
+```
+
+```{r}
+# plot mean and eigenfunctions
+mu_plot = data.frame(x = test_res1$workGrid, y = test_res1$mu)
+ggplot(mu_plot, aes(x = x, y = y)) + geom_line() +  xlab("Distance range") + ylab("Mean Function") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") 
+
+phi_plot = NULL
+for (i in 1:2){
+temp = data.frame(x = test_res1$workGrid, y = test_res1$phi[,i], idx = i)
+phi_plot = rbind(phi_plot, temp)
+}
+
+ggplot(phi_plot, aes(x = x, y = y, group = idx, col = factor(idx))) + geom_line() +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "bottom") + labs(col = "Eigenfunction")
+
+```
+
+
+```{r}
+CreateCovPlot(test_res1, corr = TRUE)
+#CreateCovPlot(test_res2, corr = TRUE)
+```
+
+```{r}
+# PC score functions
+Xi_hat1 = test_res1$xiEst
+#Xi_hat2 = test_res2$xiEst
+
+
+test_df = tnbc_clinical
+clin_rm = unlist(sapply(samp_rm, function(x) which(tnbc_clinical$InternalId == x))) 
+
+test_df = test_df[-clin_rm,]
+test_df$patient_class = tnbc_class$patient_class[-samp_rm]
+
+data_combine = data.frame(event = ifelse(test_df$Censored == 1, 0, 1), stime = test_df$`Survival_days_capped*`/365, pclass = factor(test_df$patient_class),  Age = test_df$AGE_AT_DX, spa_e = Xi_hat1)#, res_e = Xi_hat2)  #spa_e: spatial entropy, res_e: residual entropy
+
+
+test_fit <- gam(stime ~   Age + spa_e.1 , weights=event, data = data_combine, family=cox.ph()) 
+
+summary(test_fit)
+
+# alternatively
+#fullcoxresult<-coxph(formula=Surv(stime,event)~ ., data = data_combine)
+#fullcoxresult<-coxph(formula=Surv(stime,event)~ pclass, data = data_combine)
+
+```
+
+
+```{r}
+# alternatively
+fullcox<-coxph(formula=Surv(stime,event)~ Age + spa_e.1 + spa_e.2 , data = data_combine) 
+nestcox<-coxph(formula=Surv(stime,event)~ Age  , data = data_combine)
+anova(fullcox, nestcox)
+```
+#=====================#
+### ovarian data
+#=====================#
+```{r, warning=FALSE, message=FALSE}
+
+setwd("~/Documents/Imaging project/Vectra /Ovarian_survival_output")
+load("Ovarian_workspace.RData")
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+ovarian_data = ovarian_data %>% mutate(`Phenotype CD3+CD8+`=case_when(
+  `Phenotype CD3` =="CD3+" & `Phenotype CD8`=="CD8+" ~ "CD3+CD8+",
+  TRUE~ ""
+))
+
+
+ovarian_data = ovarian_data %>% mutate(`Phenotype CD3+CD8-`=case_when(
+  `Phenotype CD3` =="CD3+" & `Phenotype CD8`=="CD8-" ~ "CD3+CD8-",
+  TRUE~ ""
+))
+ 
+
+ovarian_data = ovarian_data %>% mutate(`Phenotype all` = case_when(
+  `Phenotype CD3+CD8+` == "CD3+CD8+"  ~ "CD8+",
+  `Phenotype CD3+CD8-` == "CD3+CD8-" ~ "CD4+",
+  `Phenotype CD19` == "CD19+" ~ "CD19+",
+  `Phenotype CD68` == "CD68+" ~ "CD68+",
+  `Phenotype CK` == "CK+" ~ "CK+",
+  TRUE~""
+))
+
+#ovarian_data$`Phenotype all` = NULL
+
+```
+
+#best vs worst survival 
+```{r}
+n_surv = 15
+event_id = which(clinical_data_merge2$`Death (1=yes, 0=no)` == 1)
+censor_id = which(clinical_data_merge2$`Death (1=yes, 0=no)` == 0)
+#best_surv = event_id[order(lung_clinical_data$`Survival (days)`[event_id], decreasing = T)[1:n_surv]]
+best_surv = censor_id[order(clinical_data_merge2$stime[censor_id], decreasing = T)[1:n_surv]]
+worst_surv = event_id[order(clinical_data_merge2$stime[event_id])[1:n_surv]]
+
+#plt_group =  c(1,73,  69,100, 120, 118)
+patient_idx1 = patient_idx[image_idx]
+
+df <- NULL
+for(i in sort(head(best_surv))){
+ temp = patient_idx1[[i]]
+ cell_rm = c(which(ovarian_data$`Phenotype all`[temp] == ""), which(ovarian_data$`Phenotype all`[temp] == "CK+"))
+     #which(ovarian_data$`Phenotype all`[temp] == "")#
+ if (length(cell_rm) > 0){temp = temp[-cell_rm]
+}else {temp = temp}
+
+temp_df = data.frame(x = ovarian_data$`Cell X Position`[temp], y =  ovarian_data$`Cell Y Position`[temp], cell_type = as.factor(ovarian_data$`Phenotype all`[temp]), patient = paste0("p", i))
+df <- rbind(df,temp_df)
+
+}
+
+df$patient = factor(df$patient, levels = unique(df$patient))
+ggplot(df, aes(x = x, y = y, col = cell_type)) + geom_point(size = 0.1)  + theme(plot.title = element_text(hjust = 0.5))+ theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + facet_wrap(~ patient, scales = "free")+ guides(x = "none", y = "none") #xlab("X position") + ylab("Y position") 
+
+
+df <- NULL
+for(i in sort(head(worst_surv))){
+   
+ temp = patient_idx1[[i]]
+ cell_rm = c(which(ovarian_data$`Phenotype all`[temp] == ""), which(ovarian_data$`Phenotype all`[temp] == "CK+"))
+     #which(ovarian_data$`Phenotype all`[temp] == "")#
+ if (length(cell_rm) > 0){temp = temp[-cell_rm]
+}else {temp = temp}
+
+temp_df = data.frame(x = ovarian_data$`Cell X Position`[temp], y =  ovarian_data$`Cell Y Position`[temp], cell_type = as.factor(ovarian_data$`Phenotype all`[temp]), patient = paste0("p", i))
+df <- rbind(df,temp_df)
+
+}
+df$patient = factor(df$patient, levels = unique(df$patient))
+ggplot(df, aes(x = x, y = y, col = cell_type)) + geom_point(size = 0.1) + theme(plot.title = element_text(hjust = 0.5))+ theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + facet_wrap(~ patient, scales = "free") #+ guides(x = "none", y = "none") #xlab("X position") + ylab("Y position") 
+
+# for manuscript
+
+df <- NULL
+for(i in c(9, 25, 90, 102)){
+   
+ temp = patient_idx1[[i]]
+ cell_rm = c(which(ovarian_data$`Phenotype all`[temp] == ""), which(ovarian_data$`Phenotype all`[temp] == "CK+"))
+     #which(ovarian_data$`Phenotype all`[temp] == "")#
+ if (length(cell_rm) > 0){temp = temp[-cell_rm]
+}else {temp = temp}
+
+temp_df = data.frame(x = ovarian_data$`Cell X Position`[temp], y =  ovarian_data$`Cell Y Position`[temp], cell_type = as.factor(ovarian_data$`Phenotype all`[temp]), patient = paste0("p", i))
+df <- rbind(df,temp_df)
+
+}
+df$patient = factor(df$patient, levels = unique(df$patient))
+ggplot(df, aes(x = x, y = y, col = cell_type)) + geom_point(size = 0.1) + theme(plot.title = element_text(hjust = 0.5))+ theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + facet_wrap(~ patient, scales = "free") + guides(x = "none", y = "none") #xlab("X position") + ylab("Y position") 
+
+```
+
+
+```{r, warning=FALSE, echo = FALSE, message=FALSE}
+# spatial entropy and residual entropy
+n_break = 20
+ovarian_entropy = list()
+#dist_range = c(25, 50, 80, 100, 120, 150, 200, 300, 400, 500, 600, 700, 1000) 
+
+for (i in 1:n_patient){
+  if(i %% 20 == 0){
+    cat(paste0("iteration: ", i, "\n"))
+  }
+  
+temp = patient_idx[[i]]
+
+cell_rm = c(which(ovarian_data$`Phenotype all`[temp] == ""), which(ovarian_data$`Phenotype all`[temp] == "CK+"))
+if (length(cell_rm) > 0){temp = temp[-cell_rm]
+}else {temp = temp}
+
+x_pos = ovarian_data$`Cell X Position`[temp]
+y_pos = ovarian_data$`Cell Y Position`[temp]
+patient_i = ppp(x_pos, y_pos, c(min(x_pos), max(x_pos)), c(min(y_pos), max(y_pos)))
+patient_i = patient_i %mark% as.factor(ovarian_data$`Phenotype all`[temp])
+
+
+dist_i = pairdist(patient_i)
+rmax_i= max(dist_i[lower.tri(dist_i, diag = FALSE)])
+dist_i = exp(seq(log(0.05*rmax_i), log(rmax_i), length.out = 20))  #make.even.breaks(rmax_i, bstep = rmax_i/20)$r
+dist_i = dist_i[-length(dist_i)]
+ 
+
+ovarian_entropy[[i]] = altieri(patient_i, distbreak = dist_i) 
+}
+```
+
+#setwd("~/Documents/Imaging project/Vectra /Spatial entropy output")
+#load("ovarian_maxdist.RData")
+```{r}
+
+ovarian_entropy = ovarian_entropy[image_idx]
+n_break = length(ovarian_entropy[[1]]$class.pairs) #20
+dist_all = spi_all = res_all = list()
+df <- NULL
+for(i in 1:length(ovarian_entropy)){
+   
+temp = ovarian_entropy[[i]]
+dist_i = unique(c(temp$distance.breaks[,1],temp$distance.breaks[,2]))[-1]
+spi_i = temp$SPI.terms
+res_i = temp$RES.terms
+dist_all[[i]] = dist_i 
+spi_all[[i]] = spi_i
+res_all[[i]] = res_i
+temp_df = data.frame(dist_break = dist_i, spi_i = spi_i, res_i  =  res_i, patient = paste0("Patient ", i))
+df = rbind(df, temp_df)
+}
+```
+
+
+```{r}
+#unlist(lapply(spi_all, function(x) sum(is.finite(x))))
+# there're some inf values in spi_all: #44, 69
+#entropy calculation
+e_spatial_calc = function(p1, p2){
+  # p1, p2: vector of probabilities numer vs. denom
+  idx1 = which(p1 == 0)
+  idx2 = which(p2 == 0)
+  id_rm = union(idx1, idx2)
+  
+  res = sum(p1[-id_rm]*log(p1[-id_rm]/p2[-id_rm]))
+  
+  return(res)
+}
+
+
+check_group = which(unlist(lapply(spi_all, function(x) sum(is.finite(x)))) != n_break)
+for (i in check_group){
+temp = lapply(ovarian_entropy[[i]]$cond.Z.distribution, function(x) e_spatial_calc(x$rel.freq, ovarian_entropy[[i]]$ShannonZ$`marginal distribution`$rel.freq))
+spi_all[[i]] = as.numeric(unlist(temp))
+}
+```
+
+```{r}
+df <- NULL
+for(i in 1:length(ovarian_entropy)){
+dist_i = dist_all[[i]] 
+spi_i = spi_all[[i]] 
+res_i = res_all[[i]]
+temp_df = data.frame(dist_break = dist_i, spi_i = spi_i, res_i  =  res_i, patient = paste0("Patient ", i))
+df = rbind(df, temp_df)
+}
+```
+
+```{r, warning=FALSE, echo = FALSE, message=FALSE}
+
+ggplot(df, aes(x = dist_break, y = spi_i, group = patient)) + geom_line(alpha = 0.4) + xlab("r (microns)") + ylab("Spatial Entropy")   + theme(plot.title = element_text(hjust = 0.5))+ theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none")
+
+
+ggplot(df, aes(x = dist_break, y = res_i, col = patient)) + geom_line() + xlab("r (microns)") + ylab("Residual Entropy")   + theme(plot.title = element_text(hjust = 0.5))+ theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none")
+
+```
+
+
+```{r}
+temp <- NULL
+for(i in best_surv){ 
+  temp_df <- data.frame(x = dist_all[[i]], y = spi_all[[i]], col=i)
+  temp <- rbind(temp,temp_df)} 
+
+ggplot(temp,aes(x = x, y = y, group=col)) + geom_line(stat = "identity", alpha = 0.4) +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") + ylim(0,1)
+
+
+temp <- NULL
+for(i in worst_surv){ 
+  temp_df <- data.frame(x = dist_all[[i]], y = spi_all[[i]], col=i)
+  temp <- rbind(temp,temp_df)} 
+
+ggplot(temp,aes(x = x, y = y, group=col)) + geom_line(stat = "identity", alpha = 0.4) +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") + ylim(0,1)
+
+temp <- NULL
+for(i in best_surv){ 
+  temp_df <- data.frame(x = dist_all[[i]], y = res_all[[i]], col=i)
+  temp <- rbind(temp,temp_df)} 
+
+ggplot(temp,aes(x = x, y = y, group=col)) + geom_line(stat = "identity", alpha = 0.4) +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") 
+
+
+temp <- NULL
+for(i in worst_surv){ 
+  temp_df <- data.frame(x = dist_all[[i]], y = res_all[[i]], col=i)
+  temp <- rbind(temp,temp_df)} 
+
+ggplot(temp,aes(x = x, y = y, group=col)) + geom_line(stat = "identity", alpha = 0.4) +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") 
+
+```
+
+
+```{r}
+
+df1 = df[,-3]
+colnames(df1) = c(".index", ".value", ".id")
+df1 = df1[,c(".id", ".index", ".value")]
+
+test_mdl = fpca.sc(ydata = df1)
+#plot_shiny(obj = test_mdl)
+```
+
+
+```{r}
+plot(test_mdl$scores[,1:2])
+```
+
+```{r, warning=FALSE, echo = FALSE, message=FALSE}
+# spatial entropy has inf values due to 0 prob in marginal Z distribution
+test_res1 <- FPCA(spi_all, dist_all)#, list(userBwMu = 10, dataType='Sparse', error=FALSE, kernel='epan', verbose=TRUE))
+plot(test_res1) 
+test_res2 <- FPCA(res_all, dist_all)#, list(userBwMu = 10, dataType='Sparse', error=FALSE, kernel='epan', verbose=TRUE))
+plot(test_res2) 
+test_res1$cumFVE
+# predicted trajectories?
+#CreatePathPlot(test_res1, subset = c(head(best_surv, 3)), showMean = T, ylim = c(0,2.5))
+#CreatePathPlot(test_res1, subset = c(head(worst_surv, 3)), showMean = T, ylim = c(0,2.5))
+
+#CreateCovPlot(test_res1, corr = TRUE)
+```
+
+```{r}
+# plot mean and eigenfunctions
+mu_plot = data.frame(x = test_res1$workGrid, y = test_res1$mu)
+ggplot(mu_plot, aes(x = x, y = y)) + geom_line() +  xlab("Distance range") + ylab("Mean Function") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "none") 
+
+phi_plot = NULL
+for (i in 1:3){
+temp = data.frame(x = test_res1$workGrid, y = test_res1$phi[,i], idx = i)
+phi_plot = rbind(phi_plot, temp)
+}
+
+ggplot(phi_plot, aes(x = x, y = y, group = idx, col = factor(idx))) + geom_line() +  xlab("Distance range") + ylab("Entropy") + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + theme(legend.position = "bottom") + labs(col = "Eigenfunction")
+
+```
+
+
+
+```{r}
+# PC score functions
+Xi_hat1 = test_res1$xiEst #test_mdl$scores[,1:3]
+Xi_hat2 = test_res2$xiEst
+#plot(Xi_hat1[,1], Xi_hat1[,2])
+data_combine = data.frame(event = clinical_data_merge2$`Death (1=yes, 0=no)`, stime = clinical_data_merge2$stime, 
+                          Age = clinical_data_merge2$`Age at Diagnosis`,  spi_e = Xi_hat1) #, res_e = Xi_hat2)  #spa_e: spatial entropy, res_e: residual entropy
+
+test_fit <- gam(stime ~   Age + spi_e.1 + spi_e.2 + spi_e.3 , weights=event, data = data_combine, family=cox.ph()) #
+test_fit2  = gam(stime ~   Age , weights=event, data = data_combine, family=cox.ph()) 
+summary(test_fit)
+# alternatively
+fullcox<-coxph(formula=Surv(stime,event)~ Age + spi_e.1 + spi_e.2 + spi_e.3 , data = data_combine) #
+nestcox<-coxph(formula=Surv(stime,event)~ Age  , data = data_combine)
+anova(fullcox, nestcox)
+```
+
+
